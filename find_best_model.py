@@ -17,7 +17,7 @@ For a given USGS gauge, this script:
 2. Runs N Latin-hypercube parameter realizations of every MARRMoT model
    (the same random search as `run_param_sweep` in Example 5), in parallel.
 3. Saves one table per model, with each realization's parameters and its
-   NSE, KGE (+ r, alpha, beta), PBIAS, correlation, peak-flow difference,
+   NSE, KGE (+ KGE_r, KGE_alpha, KGE_beta), PBIAS, correlation, peak-flow difference,
    pdi_ave, pdi_ave2, pdi_ave3, pdi_low, pdi_high and log_NSE, to
    `performance/<gauge>/model_NN_<name>.parquet`, plus a `summary.parquet`
    with each model's best scores.
@@ -438,12 +438,14 @@ def compute_metrics(sim):
         kge = pm.kge(sim, "Q", "Qobs")
     except Exception:
         kge = dict.fromkeys(("KGE", "r", "alpha", "beta"), np.nan)
+    # KGE components are prefixed: several MARRMoT models have parameters
+    # named r, alpha or beta, which share the table with the metrics.
     return {
         "NSE": _safe(pm.nse, sim, "Q", "Qobs"),
         "KGE": kge["KGE"],
-        "r": kge["r"],
-        "alpha": kge["alpha"],
-        "beta": kge["beta"],
+        "KGE_r": kge["r"],
+        "KGE_alpha": kge["alpha"],
+        "KGE_beta": kge["beta"],
         "PBIAS": _safe(pm.pbias, sim, "Q", "Qobs"),
         "correlation": _safe(pm.correlation, sim, "Q", "Qobs"),
         "mean_annual_peak_flow_diff": _safe(pm.mean_annual_peak_flow_difference, sim, "Q", "Qobs"),
@@ -492,6 +494,9 @@ def _build_table(samples, outcomes):
         row = dict(params)
         row["error"] = error
         if metrics is not None:
+            clash = row.keys() & metrics.keys()
+            if clash:  # a metric would overwrite a parameter of the same name
+                raise ValueError(f"metric name(s) {sorted(clash)} clash with model parameters")
             row.update(metrics)
         rows.append(row)
     table = pd.DataFrame(rows)

@@ -21,7 +21,7 @@ USGS gauge ──► find_best_model.py ──► performance/<gauge>/*.parquet 
                  └─ N random realizations × 46 models                        └─ best_model_<metric>.json
 ```
 
-Every realization is scored on NSE, KGE (and its r, alpha, beta parts), PBIAS,
+Every realization is scored on NSE, KGE (and its parts, saved as KGE_r, KGE_alpha, KGE_beta), PBIAS,
 correlation, mean annual peak-flow difference, log-NSE and several
 `pdi_*` indexes. The first year(s) are a warm-up period and are not scored.
 
