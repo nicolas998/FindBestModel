@@ -204,16 +204,19 @@ def check_parameter_space():
         raise ValueError("Parameter space does not match MODEL_REGISTRY:\n  " + "\n  ".join(problems))
 
 
-def sample_parameters(model_num, n, seed=None):
+def sample_parameters(model_num, n, seed=None, space=None):
     """
     Latin-hypercube sample of `n` parameter sets for `model_num` (same scheme
     as `run_param_sweep` in Example 5).
+
+    `space` replaces `PARAM_SPACE[model_num]` (same layout), e.g. to sample
+    narrower ranges than the defaults.
 
     Returns:
         pd.DataFrame: one row per realization, columns in the order of
             `MODEL_REGISTRY[model_num]['param_names']`.
     """
-    space = PARAM_SPACE[model_num]
+    space = PARAM_SPACE[model_num] if space is None else space
     sampled = [name for name, spec in space.items() if not isinstance(spec, Derived)]
 
     rng = np.random.default_rng(seed)

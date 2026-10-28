@@ -106,6 +106,44 @@ The notebook shows:
 The selected model, its parameters and its metrics are saved to
 `performance/02249500/best_model_KGE.json`.
 
+## Designing a composite metric: `cpm_app.py`
+
+A Streamlit app for building a composite performance metric (CPM) that
+scores both the timing of a simulation and its flow distribution:
+
+```bash
+streamlit run cpm_app.py
+```
+
+In the sidebar, choose a gauge, a period and a model (CRB3, model 11, by
+default), and optionally narrow the parameter ranges. **Download data and
+run** fetches the data (same sources and `data/` cache as
+`find_best_model.py`) and runs N random parameter sets (100 by default),
+keeping every simulated series.
+
+Like KGE, the CPM is one minus a Euclidean distance from the ideal point:
+
+```
+CPM = 1 - sqrt( sum_i (w_i / max(w) * (x_i - 1)) ** 2 )
+```
+
+Its components x_i are NSE (capped to 0–1), the mean and standard-deviation
+ratios, the sim/obs ratios of the 5, 10, 25, 75, 90 and 95th percentiles, and
+the Pearson and Spearman correlations. Each weight w_i (0–10, step 0.5) has its
+own slider. The weights are relative, so equal weights on Pearson r, mean ratio
+and deviation ratio alone give exactly KGE.
+
+You can edit up to 5 configurations side by side. Each one has an identifier
+computed from its weights (`CPM-XXXXXX`: the same weights always give the
+same ID) and its own color. Each configuration picks its best realization,
+which the app shows over the observed hydrograph and the top-ranked members
+of the ensemble. Below the hydrograph are a table of every component of that
+best run, its relative error through time, its flow PDF minus the observed
+PDF, and its flow duration curve and Q-Q plot against the observations
+(each with a log/linear switch). **Save to library** writes the configuration to
+`cpm_configs/<ID>.json`, with the run settings and the best run's components
+and parameters. Saved files can be loaded again from the library or uploaded.
+
 ## Command-line options
 
 | Option | Default | Description |
@@ -136,6 +174,8 @@ python find_best_model.py --gauge 02317620 --n 500 --start-year 2021 --end-year 
 |---|---|
 | `find_best_model.py` | main script: data download, parallel random search, result tables |
 | `compare_models.ipynb` | ranking, plots and model selection |
+| `cpm_app.py` | Streamlit app to design and compare composite performance metrics |
+| `composite_metric.py` | CPM components and score, configuration JSON files, ensemble runner that keeps the series |
 | `marrmot_models.py` | Python port of the 46 MARRMoT model structures (`MODEL_REGISTRY`) |
 | `model_parameter_space.py` | parameter sampling ranges for every model; edit these to change the prior |
 | `performance_metrics.py` | NSE, KGE, PBIAS, pdi and other goodness-of-fit metrics |

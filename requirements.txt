@@ -11,6 +11,9 @@ xarray>=2024.2
 zarr>=2.17
 shapely>=2.0
 
+# cpm_app.py
+streamlit>=1.50
+
 # compare_models.ipynb
 matplotlib>=3.8
 plotly>=5.20
