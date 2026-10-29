@@ -58,6 +58,7 @@ SLIDER_GROUPS = {
     "High-flow percentiles": ["P75", "P90", "P95"],
 }
 
+cm.skip_main_in_workers()
 st.set_page_config(page_title="CPM Explorer", page_icon=":material/water:", layout="wide")
 ss = st.session_state
 

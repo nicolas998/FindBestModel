@@ -29,8 +29,10 @@ JSON files.
 
 import contextlib
 import hashlib
+import importlib.machinery
 import json
 import math
+import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -313,6 +315,21 @@ def _simulate_one(model_num, params):
 
 def _simulate_chunk(model_num, start, param_rows):
     return start, [_simulate_one(model_num, params) for params in param_rows]
+
+
+def skip_main_in_workers():
+    """
+    Call at the top of a Streamlit app before `run_ensemble` uses processes.
+
+    On Windows a worker process starts by running the parent's __main__
+    script again, unless that module has a spec named "__main__". Streamlit
+    registers the app script as __main__ without a spec, so every worker
+    would run the whole app outside a session, crash, and leave the pool
+    waiting forever. The workers only need this module.
+    """
+    main = sys.modules["__main__"]
+    if getattr(main, "__spec__", None) is None:
+        main.__spec__ = importlib.machinery.ModuleSpec("__main__", None)
 
 
 def _worker_data(data):

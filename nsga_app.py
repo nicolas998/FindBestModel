@@ -51,6 +51,7 @@ INK = {
 }
 DASHES = ["solid", "dash", "dot"]
 
+cm.skip_main_in_workers()
 st.set_page_config(page_title="NSGA-II Calibration", page_icon=":material/tune:", layout="wide")
 ss = st.session_state
 
