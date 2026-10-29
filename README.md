@@ -208,6 +208,25 @@ stopped (changing a control while it runs stops it) keeps what it finished;
 loading it from **Saved calibrations** computes its fronts. A run can also be
 opened directly with `?run=<folder>` in the app's URL.
 
+To move runs between machines (e.g. to and from the app on a web server),
+the results of a run have three buttons:
+
+- **Download run (.zip)**: every file of the run. Uploading that zip under
+  **Saved calibrations** unpacks it into `nsga_calib/` and opens it. Only the
+  five run files are read from the zip, under their own names, and the
+  folder is named from the run's settings; the same run already in
+  `nsga_calib/` is reused instead of copied, and a zip that would unpack to
+  more than 500 MB is refused.
+- **Download settings (.json)**: the run's `settings.json`. Uploading it
+  puts that setup in the sidebar.
+- **Use these settings in the sidebar**: the same, from the open run.
+
+The setup is the gauge, period, spin-up, forcing, model, the initial search
+ranges and their limits, the CPMs (with their weights, so a CPM missing from
+`cpm_configs/` comes back too) and every NSGA-II setting except the number of
+processes, which belongs to the machine. Change anything, then press
+**Calibrate** to run it again.
+
 ## Command-line options
 
 | Option | Default | Description |

@@ -31,6 +31,9 @@ Output folder: nsga_calib/<YYYYmmdd-HHMMSS>_usgs<gauge>_m<model>/
     pareto_fronts.csv     the evaluations that are on any front
     front_series.parquet  observed flow and the flow of every front member
 
+`zip_run` and `import_run` move a run between machines as a zip of that
+folder (the app's download and upload).
+
 Used by the Streamlit app `nsga_app.py`.
 """
 
@@ -39,7 +42,9 @@ import io
 import itertools
 import json
 import math
+import re
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -492,6 +497,88 @@ def finish_run(path, settings, evaluations, data):
 # ---------------------------------------------------------------------------
 # Saved runs
 # ---------------------------------------------------------------------------
+
+RUN_FILES = ("settings.json", "evaluations.csv", "history.csv", "pareto_fronts.csv",
+             "front_series.parquet")
+MAX_UNZIPPED = 500 * 2 ** 20  # [bytes] largest run `import_run` unpacks
+_RUN_NAME = re.compile(r"\d{8}-\d{6}_usgs\d+_m\d{2}")
+
+
+def zip_run(path):
+    """The files of the run in `path` as zip bytes, in a folder named like
+    the run (the layout `import_run` reads)."""
+    path = Path(path)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in RUN_FILES:
+            if (path / name).exists():
+                archive.write(path / name, f"{path.name}/{name}")
+    return buffer.getvalue()
+
+
+def import_run(data):
+    """
+    Unpacks a run zipped by `zip_run` into nsga_calib/ and returns its folder.
+
+    Only the files of RUN_FILES are read, at the top of the zip or in one
+    folder, and they are written under their own names into a folder named
+    from the run's settings, so nothing in the zip decides where files go.
+    The same run already in nsga_calib/ (identical settings.json) is reused;
+    any other name clash gets a new folder.
+
+    Raises:
+        ValueError: `data` is not a zipped run, or unpacks to more than
+            MAX_UNZIPPED bytes.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("not a zip file") from None
+    with archive:
+        members = {}
+        for info in archive.infolist():
+            folder, _, name = info.filename.replace("\\", "/").rpartition("/")
+            if info.is_dir() or name not in RUN_FILES or "/" in folder:
+                continue
+            if name in members:
+                raise ValueError(f"the zip holds more than one {name}")
+            members[name] = (folder, info)
+        if not {"settings.json", "evaluations.csv"} <= set(members):
+            raise ValueError("no settings.json and evaluations.csv: not a run saved in nsga_calib/")
+        if sum(info.file_size for _, info in members.values()) > MAX_UNZIPPED:
+            raise ValueError(f"the run unpacks to more than {MAX_UNZIPPED // 2 ** 20} MB")
+        # ZipFile.read stops at each file's declared size, so this is bounded too
+        files = {name: archive.read(info) for name, (_, info) in members.items()}
+
+    try:
+        settings = json.loads(files["settings.json"])
+        gauge, model = str(settings["gauge"]), int(settings["model"])
+        objectives = [o["id"] for o in settings["objectives"]]
+        evaluations = pd.read_csv(io.BytesIO(files["evaluations.csv"]), index_col="evaluation")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"settings.json or evaluations.csv cannot be read ({exc})") from None
+    if not gauge.isdigit() or model not in marrmot.MODEL_REGISTRY:
+        raise ValueError(f"unknown gauge or model in settings.json ({gauge!r}, {model!r})")
+    if not set(objectives) <= set(evaluations):
+        raise ValueError("evaluations.csv has no column for some of the run's objectives")
+    if "front_series.parquet" in files:
+        pd.read_parquet(io.BytesIO(files["front_series.parquet"]))  # raises if unreadable
+
+    folder = members["settings.json"][0]
+    if not _RUN_NAME.fullmatch(folder):
+        stamp = pd.Timestamp(settings.get("started_at") or datetime.now()).strftime("%Y%m%d-%H%M%S")
+        folder = f"{stamp}_usgs{gauge}_m{model:02d}"
+    path, n = OUT_DIR / folder, 1
+    while path.exists():
+        if (path / "settings.json").read_bytes() == files["settings.json"]:
+            return path
+        n += 1
+        path = OUT_DIR / f"{folder}_{n}"
+    path.mkdir(parents=True)
+    for name, content in files.items():
+        (path / name).write_bytes(content)
+    return path
+
 
 def list_runs():
     """Saved runs, newest first: list of (path, settings)."""
