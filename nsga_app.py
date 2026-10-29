@@ -36,6 +36,28 @@ from model_parameter_space import PARAM_SPACE, free_parameters, space_from_table
 
 DEFAULT_MODEL = 11  # Collie River Basin 3 (CRB3)
 DEFAULT_OBJECTIVES = ["Timing only", "Distribution only"]
+PRECIP_SOURCES = {"aorc": "AORC, basin average", "nasa": "NASA POWER, at the gauge"}
+
+# Sidebar widgets keep their values in session state under these keys, so a
+# run's settings can be put back into them (`_use_settings`). Percentages are
+# shown for the dynamic-range settings, which are stored as fractions.
+SIDEBAR_DEFAULTS = {
+    "gauge": "02249500", "start_year": 2016, "end_year": 2020, "spinup_days": 365,
+    "precip_source": "aorc", "et_method": "Turc", "model": DEFAULT_MODEL,
+    "pop_size": 50, "generations": 30, "crossover_prob": 0.9, "crossover_eta": 15.0,
+    "mutation_eta": 20.0, "seed": 1, "n_procs": min(4, os.cpu_count() or 1),
+    "adapt_ranges": True, "adapt_every": nc.ADAPT_DEFAULTS["adapt_every"],
+    "adapt_step": round(100 * nc.ADAPT_DEFAULTS["adapt_step"]),
+    "adapt_edge": round(100 * nc.ADAPT_DEFAULTS["adapt_edge"]),
+    "adapt_share": round(100 * nc.ADAPT_DEFAULTS["adapt_share"]),
+}
+# (min, max) of the numeric inputs; their type is the widget's type
+LIMITS = {
+    "start_year": (1982, 2100), "end_year": (1982, 2100), "spinup_days": (0, 3650),
+    "pop_size": (4, 500), "generations": (1, 1000), "crossover_prob": (0.0, 1.0),
+    "crossover_eta": (1.0, 100.0), "mutation_eta": (1.0, 100.0), "seed": (0, 1_000_000),
+    "adapt_every": (1, 100), "adapt_step": (5, 200), "adapt_edge": (1, 25), "adapt_share": (5, 100),
+}
 MAX_LINES = 40  # front members drawn per front in the series plots
 
 # Categorical slots 1-5 of the reference palette, light and dark steps (same
@@ -112,9 +134,99 @@ def _upload_cpms():
     ss.upload_n += 1  # a fresh uploader, so the same file can be uploaded again
 
 
+def _sidebar_values(settings):
+    """Sidebar values for a run's settings, checked against what the widgets
+    accept (settings can come from an uploaded file)."""
+    adapt = {**nc.ADAPT_DEFAULTS, **settings}  # runs from before dynamic ranges
+    values = {
+        "gauge": str(settings["gauge"]).strip(), "model": int(settings["model"]),
+        "precip_source": settings["precip_source"], "et_method": settings["et_method"],
+        "adapt_ranges": bool(adapt["adapt_ranges"]), "adapt_every": adapt["adapt_every"],
+        **{k: 100 * adapt[k] for k in ("adapt_step", "adapt_edge", "adapt_share")},
+        **{k: settings[k] for k in ("start_year", "end_year", "spinup_days", "pop_size",
+                                    "generations", "crossover_prob", "crossover_eta",
+                                    "mutation_eta", "seed")},
+    }
+    for key, (lo, hi) in LIMITS.items():
+        value = type(lo)(round(values[key]) if isinstance(lo, int) else values[key])
+        if not lo <= value <= hi:
+            raise ValueError(f"{key} = {value} is outside {lo}–{hi}")
+        values[key] = value
+    if not values["gauge"].isdigit():
+        raise ValueError(f"gauge {values['gauge']!r} is not a USGS site number")
+    if values["model"] not in marrmot.MODEL_REGISTRY:
+        raise ValueError(f"there is no MARRMoT model {values['model']}")
+    if values["precip_source"] not in PRECIP_SOURCES or values["et_method"] not in usgs.ET_METHODS:
+        raise ValueError("unknown precipitation source or ET method")
+    return values
+
+
+def _use_settings(settings, source):
+    """Puts a run's settings into the sidebar: everything but the number of
+    processes (a property of this machine), with the run's initial search
+    ranges and limits, and its CPMs."""
+    try:
+        values = _sidebar_values(settings)
+        model = values["model"]
+        rows = pd.DataFrame(settings["parameter_ranges"])
+        if list(rows["parameter"]) != list(PARAM_SPACE[model]):
+            raise ValueError(f"the parameter ranges are not those of model {model}")
+        space = space_from_table(model, rows)
+        limits = settings.get("parameter_limits")  # runs from before dynamic ranges have none
+        table = nc.range_table(model, space, None if limits is None else
+                               {p: tuple(v) for p, v in limits.items()})
+        nc.limits_from_table(model, table, space)
+        configs = [cm.parse_configs(json.dumps(o))[0] for o in settings["objectives"]]
+        if not 1 <= len(configs) <= 3:
+            raise ValueError("a run has one to three CPMs")
+        n_free = len(free_parameters(space))
+        mutation = settings.get("mutation_prob")
+    except (KeyError, TypeError, ValueError) as exc:
+        detail = f"missing {exc}" if isinstance(exc, KeyError) else str(exc)
+        ss.run_messages.append(("error", f"Cannot use the settings of {source}: {detail}"))
+        return
+    for key, value in values.items():
+        ss[key] = value
+    ss[f"mutation_{model}"] = (None if mutation is None or abs(mutation - 1 / n_free) < 1e-9
+                               else float(mutation))
+    ss[f"ranges_base_{model}"] = table
+    ss.ranges_n += 1  # a fresh editor showing that table
+    for config in configs:
+        ss.uploaded_cpms.setdefault(config["id"], {**config, "source": source})
+    ss.objectives = [c["id"] for c in configs]
+    ss.run_messages.append(("success", f"Sidebar set from {source}"))
+
+
+def _upload_run():
+    """A zipped run is unpacked into nsga_calib/ and opened; a settings.json
+    goes into the sidebar."""
+    file = ss[f"run_upload_{ss.run_upload_n}"]
+    ss.run_upload_n += 1  # a fresh uploader, so the same file can be uploaded again
+    if file is None:
+        return
+    try:
+        if file.name.lower().endswith(".zip"):
+            ss.pending_load = str(nc.import_run(file.getvalue()))
+        else:
+            _use_settings(json.loads(file.getvalue().decode("utf-8")), f"upload: {file.name}")
+    except (ValueError, UnicodeDecodeError) as exc:
+        ss.run_messages.append(("error", f"{file.name}: {exc}"))
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _zipped(path, modified):
+    """Zip of a run, cached until its settings.json changes (`modified`)."""
+    return nc.zip_run(path)
+
+
+for key, value in SIDEBAR_DEFAULTS.items():
+    ss.setdefault(key, value)
 ss.setdefault("uploaded_cpms", {})
 ss.setdefault("upload_messages", [])
 ss.setdefault("upload_n", 0)
+ss.setdefault("run_messages", [])
+ss.setdefault("run_upload_n", 0)
+ss.setdefault("ranges_n", 0)
 ss.setdefault("objectives", [cm.config_id(cm.PRESETS[name]) for name in DEFAULT_OBJECTIVES])
 
 
@@ -124,21 +236,20 @@ ss.setdefault("objectives", [cm.config_id(cm.PRESETS[name]) for name in DEFAULT_
 
 with st.sidebar:
     st.header("Watershed and period")
-    gauge = st.text_input("USGS gauge", "02249500")
+    gauge = st.text_input("USGS gauge", key="gauge")
     c1, c2 = st.columns(2)
-    start_year = c1.number_input("First year", 1982, 2100, 2016)
-    end_year = c2.number_input("Last year", 1982, 2100, 2020)
-    spinup_days = st.number_input("Spin-up (days, not scored)", 0, 3650, 365, step=30,
+    start_year = c1.number_input("First year", *LIMITS["start_year"], key="start_year")
+    end_year = c2.number_input("Last year", *LIMITS["end_year"], key="end_year")
+    spinup_days = st.number_input("Spin-up (days, not scored)", *LIMITS["spinup_days"], step=30,
+                                  key="spinup_days",
                                   help="The simulation starts this many days before January 1st "
                                        "of the first year.")
-    precip_source = st.selectbox("Precipitation", ["aorc", "nasa"],
-                                 format_func={"aorc": "AORC, basin average",
-                                              "nasa": "NASA POWER, at the gauge"}.get)
-    et_method = st.selectbox("Potential ET", usgs.ET_METHODS, index=usgs.ET_METHODS.index("Turc"))
+    precip_source = st.selectbox("Precipitation", list(PRECIP_SOURCES), key="precip_source",
+                                 format_func=PRECIP_SOURCES.get)
+    et_method = st.selectbox("Potential ET", usgs.ET_METHODS, key="et_method")
 
     st.header("Model")
-    models = sorted(marrmot.MODEL_REGISTRY)
-    model = st.selectbox("MARRMoT model", models, index=models.index(DEFAULT_MODEL),
+    model = st.selectbox("MARRMoT model", sorted(marrmot.MODEL_REGISTRY), key="model",
                          format_func=lambda m: f"{m:02d} · {marrmot.MODEL_REGISTRY[m]['name']}")
     with st.expander("Parameter search ranges (optional)"):
         st.caption("NSGA-II starts searching between low and high. With dynamic ranges (NSGA-II "
@@ -146,7 +257,8 @@ with st.sidebar:
                    "storages up to 4000 mm, every other parameter only up to its default range. "
                    "Fractions multiply the parameter they refer to; derived parameters are "
                    "computed from the others.")
-        ranges = st.data_editor(nc.range_table(model), key=f"ranges_{model}", hide_index=True,
+        ranges = st.data_editor(ss.get(f"ranges_base_{model}", nc.range_table(model)),
+                                key=f"ranges_{model}_{ss.ranges_n}", hide_index=True,
                                 disabled=["parameter", "sampled as"], width="stretch")
     n_free = len(free_parameters(PARAM_SPACE[model]))
 
@@ -171,13 +283,16 @@ with st.sidebar:
 
     st.header("NSGA-II")
     c1, c2 = st.columns(2)
-    pop_size = c1.number_input("Calibrations per generation", 4, 500, 50, step=2,
+    pop_size = c1.number_input("Calibrations per generation", *LIMITS["pop_size"], step=2,
+                               key="pop_size",
                                help="Population size: parameter sets simulated per generation.")
-    generations = c2.number_input("Generations", 1, 1000, 30)
+    generations = c2.number_input("Generations", *LIMITS["generations"], key="generations")
     c1, c2 = st.columns(2)
-    crossover_prob = c1.number_input("Crossover probability", 0.0, 1.0, 0.9, step=0.05,
+    crossover_prob = c1.number_input("Crossover probability", *LIMITS["crossover_prob"], step=0.05,
+                                     key="crossover_prob",
                                      help="Chance that a pair of parents is recombined (SBX).")
-    crossover_eta = c2.number_input("Crossover index ηc", 1.0, 100.0, 15.0, step=1.0,
+    crossover_eta = c2.number_input("Crossover index ηc", *LIMITS["crossover_eta"], step=1.0,
+                                    key="crossover_eta",
                                     help="SBX distribution index: larger keeps children closer "
                                          "to their parents.")
     c1, c2 = st.columns(2)
@@ -185,34 +300,35 @@ with st.sidebar:
                                     key=f"mutation_{model}", placeholder=f"1/{n_free} = {1 / n_free:.3f}",
                                     help="Chance that each parameter of a child is mutated. "
                                          f"Empty = 1 / number of parameters (1/{n_free}).")
-    mutation_eta = c2.number_input("Mutation index ηm", 1.0, 100.0, 20.0, step=1.0,
+    mutation_eta = c2.number_input("Mutation index ηm", *LIMITS["mutation_eta"], step=1.0,
+                                   key="mutation_eta",
                                    help="Polynomial-mutation distribution index: larger makes "
                                         "smaller steps.")
     c1, c2 = st.columns(2)
-    seed = c1.number_input("Seed", 0, 1_000_000, 1)
-    cpus = os.cpu_count() or 1
-    n_procs = c2.number_input("Processes", 1, cpus, min(4, cpus),
+    seed = c1.number_input("Seed", *LIMITS["seed"], key="seed")
+    n_procs = c2.number_input("Processes", 1, os.cpu_count() or 1, key="n_procs",
                               help="Simulations run in parallel in this many processes, started "
                                    "once for the whole calibration (a few seconds on Windows).")
     st.caption(f"{pop_size * (generations + 1):,} simulations: {pop_size} initial + "
                f"{pop_size} × {generations} generations.")
 
-    adapt = nc.ADAPT_DEFAULTS
-    adapt_ranges = st.toggle("Dynamic search ranges", value=True,
+    adapt_ranges = st.toggle("Dynamic search ranges", key="adapt_ranges",
                              help="Widen a parameter's search range when the Pareto front "
                                   "crowds against one of its bounds, up to the min/max allowed "
                                   "in the parameter table.")
     if adapt_ranges:
         c1, c2 = st.columns(2)
-        adapt_every = c1.number_input("Check every (generations)", 1, 100, adapt["adapt_every"])
-        adapt_step = c2.number_input("Widen by (% of range)", 5, 200, int(100 * adapt["adapt_step"]),
-                                     step=5, help="How far a bound moves each time.")
+        adapt_every = c1.number_input("Check every (generations)", *LIMITS["adapt_every"],
+                                      key="adapt_every")
+        adapt_step = c2.number_input("Widen by (% of range)", *LIMITS["adapt_step"], step=5,
+                                     key="adapt_step", help="How far a bound moves each time.")
         c1, c2 = st.columns(2)
-        adapt_edge = c1.number_input("Edge zone (% of range)", 1, 25, int(100 * adapt["adapt_edge"]),
+        adapt_edge = c1.number_input("Edge zone (% of range)", *LIMITS["adapt_edge"],
+                                     key="adapt_edge",
                                      help="How close to a bound a member counts as at the bound.")
-        adapt_share = c2.number_input("Front at the edge (%)", 5, 100, int(100 * adapt["adapt_share"]),
-                                      step=5, help="Share of the front in the edge zone that "
-                                                   "makes the bound move.")
+        adapt_share = c2.number_input("Front at the edge (%)", *LIMITS["adapt_share"], step=5,
+                                      key="adapt_share", help="Share of the front in the edge zone "
+                                                              "that makes the bound move.")
     run_clicked = st.button("Calibrate", type="primary", width="stretch", disabled=not picked)
 
     st.header("Saved calibrations")
@@ -225,6 +341,17 @@ with st.sidebar:
             + ("" if s.get("status") == "complete" else f" ({s.get('status')})")
             for q, s in saved if str(q) == p))
     load_clicked = st.button("Load", width="stretch", disabled=saved_pick is None)
+    st.file_uploader("Upload a run (.zip) or its settings (.json)", type=["zip", "json"],
+                     key=f"run_upload_{ss.run_upload_n}", on_change=_upload_run,
+                     help="A zip downloaded from this app is unpacked into nsga_calib/ and "
+                          "opened. A settings.json puts that run's setup in the sidebar, to "
+                          "run the calibration again.")
+    for kind, text in ss.run_messages:
+        if kind == "success":
+            st.toast(text, icon=":material/check_circle:")
+        else:
+            getattr(st, kind)(text)
+    ss.run_messages = []
 
 
 st.title("NSGA-II calibration")
@@ -279,9 +406,10 @@ if run_clicked:
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
 
-if load_clicked or ("run" in st.query_params and "run" not in ss):
+pending = ss.pop("pending_load", None)  # a run unpacked from an uploaded zip
+if load_clicked or pending or ("run" in st.query_params and "run" not in ss):
     # ?run=<folder in nsga_calib/> opens that run directly
-    saved_pick = saved_pick if load_clicked else str(nc.OUT_DIR / st.query_params["run"])
+    saved_pick = saved_pick if load_clicked else pending or str(nc.OUT_DIR / st.query_params["run"])
     try:
         with st.spinner("Loading (an interrupted run is finished first: its fronts are simulated)..."):
             ss.run = nc.load_run(saved_pick)
@@ -324,6 +452,23 @@ st.caption(
     + (f"Dynamic search ranges: {len(settings['range_changes'])} bound(s) widened. "
        if settings.get("adapt_ranges") else "")
     + f"Saved in `nsga_calib/{run['path'].name}`.")
+run_name = run["path"].name
+c1, c2, c3 = st.columns(3)
+c1.download_button("Download run (.zip)",
+                   _zipped(str(run["path"]), (run["path"] / "settings.json").stat().st_mtime),
+                   f"{run_name}.zip", mime="application/zip", width="stretch",
+                   icon=":material/folder_zip:",
+                   help="Every file of this run in nsga_calib/: upload it in the sidebar, here "
+                        "or on another machine, to open it again.")
+c2.download_button("Download settings (.json)", (run["path"] / "settings.json").read_bytes(),
+                   f"{run_name}_settings.json", mime="application/json", width="stretch",
+                   icon=":material/download:",
+                   help="The setup of this run: upload it in the sidebar to run it again.")
+c3.button("Use these settings in the sidebar", on_click=_use_settings,
+          args=(settings, f"run {run_name}"), width="stretch", icon=":material/settings_backup_restore:",
+          help="Gauge, period, model, initial search ranges and limits, CPMs and NSGA-II "
+               "settings (not the number of processes), to run this calibration again or a "
+               "variation of it.")
 if settings.get("status") == "interrupted":
     st.warning(f"This run was interrupted after generation {int(evaluations['generation'].max())} "
                f"of {settings['generations']}; the fronts use the evaluations it finished.")
