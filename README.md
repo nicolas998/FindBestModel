@@ -144,6 +144,70 @@ PDF, and its flow duration curve and Q-Q plot against the observations
 `cpm_configs/<ID>.json`, with the run settings and the best run's components
 and parameters. Saved files can be loaded again from the library or uploaded.
 
+## Multi-objective calibration: `nsga_app.py`
+
+A Streamlit app that calibrates one model with NSGA-II against one to three
+CPMs:
+
+```bash
+streamlit run nsga_app.py
+```
+
+In the sidebar, choose a gauge, the scored years, a spin-up in days (the
+simulation starts that many days before January 1st of the first year), the
+precipitation source, the potential-ET method and a model, and optionally
+narrow its parameter search ranges. Then pick one to three CPMs: the presets,
+any configuration saved with `cpm_app.py` in `cpm_configs/`, or JSON files
+uploaded in the app (the files `cpm_app.py` saves or downloads). The NSGA-II
+settings are the calibrations per generation (population size), the number
+of generations, the crossover probability and distribution index (SBX), the
+mutation rate (per parameter; 1 / number of parameters by default) and
+distribution index (polynomial mutation), the seed and the number of
+processes.
+
+NSGA-II searches in the unit cube of the model's free parameters, so
+thresholds defined as fractions (e.g. field capacity of maximum storage)
+always stay valid.
+
+With **Dynamic search ranges** (on by default), every few generations a
+search range widens on any side where the population's Pareto front crowds
+against it: by default, when at least 25% of the front lies within 5% of a
+bound, that bound moves out by 50% of the range. It never moves past the
+parameter's **min/max allowed** in the parameter table. By default maximum
+storages may grow to 4000 mm (`STORE_LIMIT` in `model_parameter_space.py`),
+and every other parameter only up to its default range, because rates,
+fractions, exponents, temperatures and days of the year have physical or
+numerical limits. Raise a limit in the table to let a parameter go further.
+
+The results show:
+
+- the objective space: every simulation and the Pareto front. With three
+  CPMs, one panel per pair of CPMs, each with the front of that pair in its
+  own color, plus the front over all three (also in a 3-D view);
+- the hydrograph, flow duration curve and Q-Q plot of the members of the
+  fronts you select, over the observations, with one member highlighted on
+  demand;
+- the distribution of every parameter on each selected front, over its
+  search range (front members piled against a bound suggest widening it),
+  and the search range changes of a dynamic run;
+- the best CPM per generation, and the table of front members with their
+  parameters.
+
+Every run is saved in `nsga_calib/<date>_usgs<gauge>_m<model>/`:
+
+| File | Contents |
+|---|---|
+| `settings.json` | gauge, period, spin-up, forcing, model, objectives and their weights, NSGA-II settings, the initial and final parameter ranges, their allowed limits and every range change |
+| `evaluations.csv` | every simulation: generation, parameters, CPM of each objective, every CPM component, KGE, NSE, error, and one `front_*` flag per front |
+| `history.csv` | best CPM so far per objective after each generation |
+| `pareto_fronts.csv` | the simulations on any front |
+| `front_series.parquet` | observed flow and the simulated flow of every front member |
+
+`evaluations.csv` is written after every generation, so a run that is
+stopped (changing a control while it runs stops it) keeps what it finished;
+loading it from **Saved calibrations** computes its fronts. A run can also be
+opened directly with `?run=<folder>` in the app's URL.
+
 ## Command-line options
 
 | Option | Default | Description |
@@ -176,6 +240,8 @@ python find_best_model.py --gauge 02317620 --n 500 --start-year 2021 --end-year 
 | `compare_models.ipynb` | ranking, plots and model selection |
 | `cpm_app.py` | Streamlit app to design and compare composite performance metrics |
 | `composite_metric.py` | CPM components and score, configuration JSON files, ensemble runner that keeps the series |
+| `nsga_app.py` | Streamlit app to calibrate a model with NSGA-II against up to three CPMs |
+| `nsga_calibration.py` | NSGA-II, Pareto fronts, spin-up in days, and the `nsga_calib/` run files |
 | `marrmot_models.py` | Python port of the 46 MARRMoT model structures (`MODEL_REGISTRY`) |
 | `model_parameter_space.py` | parameter sampling ranges for every model; edit these to change the prior |
 | `performance_metrics.py` | NSE, KGE, PBIAS, pdi and other goodness-of-fit metrics |
@@ -183,8 +249,8 @@ python find_best_model.py --gauge 02317620 --n 500 --start-year 2021 --end-year 
 | `get_aorc_basin_rainfall.py` | basin-averaged hourly AORC rainfall read from the AWS Zarr store; also runs on its own |
 | `get_watershed_boundary.py` | basin polygon from the USGS NLDI service |
 
-`data/` and `performance/` are created when you run the scripts and are not
-tracked by git.
+`data/`, `performance/` and `nsga_calib/` are created when you run the
+scripts and are not tracked by git.
 
 ## Notes
 

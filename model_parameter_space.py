@@ -52,6 +52,10 @@ DDF = (0, 20)            # degree-day factor [mm/degC/d]
 INTERCEPTION = (0, 5)    # interception capacity / loss [mm, mm/d]
 TANK_THRESH = (0, 200)   # Tank-model outlet heights [mm]
 
+# How far a calibration that widens its search ranges may take a maximum
+# storage (see `default_limits`).
+STORE_LIMIT = 4000  # [mm]
+
 # (a * max(0, S - Sfc)) ** b form used by models 4, 11 and 16 in this port:
 # `a` has to be small or the flux explodes for b > 1.
 SUBSURFACE_A = (0.001, 0.1)
@@ -204,6 +208,48 @@ def check_parameter_space():
         raise ValueError("Parameter space does not match MODEL_REGISTRY:\n  " + "\n  ".join(problems))
 
 
+def free_parameters(space):
+    """Names of the parameters that are sampled (everything but Derived)."""
+    return [name for name, spec in space.items() if not isinstance(spec, Derived)]
+
+
+def spec_bounds(spec):
+    """(low, high) of a range or of a fraction."""
+    return (spec[0], spec[1]) if isinstance(spec, tuple) else (spec.lo, spec.hi)
+
+
+def with_bounds(spec, lo, hi):
+    """The same range or fraction with new bounds."""
+    return (lo, hi) if isinstance(spec, tuple) else Frac(spec.ref, lo, hi)
+
+
+def default_limits(model_num):
+    """
+    {name: (min, max)}: how far a calibration that widens its search ranges
+    (nsga_calibration.py) may take each sampled parameter by default.
+
+    Maximum storages (the generic STORE range) may grow up to STORE_LIMIT.
+    Every other parameter stays within its default range: rates, fractions,
+    exponents, temperatures and days of the year have physical or numerical
+    limits (e.g. a field capacity equal to the maximum storage divides by
+    zero in some fluxes) that no general rule captures.
+    """
+    space = PARAM_SPACE[model_num]
+    return {name: (STORE[0], STORE_LIMIT) if space[name] == STORE else spec_bounds(space[name])
+            for name in free_parameters(space)}
+
+
+def latin_hypercube(n, k, rng):
+    """(n, k) Latin-hypercube sample of the unit cube."""
+    edges = np.linspace(0.0, 1.0, n + 1)
+    unit = np.empty((n, k))
+    for j in range(k):
+        pts = rng.uniform(edges[:-1], edges[1:])
+        rng.shuffle(pts)
+        unit[:, j] = pts
+    return unit
+
+
 def sample_parameters(model_num, n, seed=None, space=None):
     """
     Latin-hypercube sample of `n` parameter sets for `model_num` (same scheme
@@ -217,15 +263,24 @@ def sample_parameters(model_num, n, seed=None, space=None):
             `MODEL_REGISTRY[model_num]['param_names']`.
     """
     space = PARAM_SPACE[model_num] if space is None else space
-    sampled = [name for name, spec in space.items() if not isinstance(spec, Derived)]
+    unit = latin_hypercube(n, len(free_parameters(space)), np.random.default_rng(seed))
+    return params_from_unit(model_num, unit, space)
 
-    rng = np.random.default_rng(seed)
-    edges = np.linspace(0.0, 1.0, n + 1)
-    unit = np.empty((n, len(sampled)))
-    for j in range(len(sampled)):
-        pts = rng.uniform(edges[:-1], edges[1:])
-        rng.shuffle(pts)
-        unit[:, j] = pts
+
+def params_from_unit(model_num, unit, space=None):
+    """
+    Parameter sets from points of the unit cube, one column per entry of
+    `free_parameters(space)`: 0 is the low end of a range (or fraction), 1 the
+    high end. Used by `sample_parameters` and by the NSGA-II calibration,
+    which searches in this cube so thresholds always stay below their
+    capacity.
+
+    Returns:
+        pd.DataFrame: as `sample_parameters`.
+    """
+    space = PARAM_SPACE[model_num] if space is None else space
+    sampled = free_parameters(space)
+    unit = np.atleast_2d(unit)
 
     # Plain ranges first, so Frac/Derived can reference them.
     table = pd.DataFrame({
@@ -243,3 +298,38 @@ def sample_parameters(model_num, n, seed=None, space=None):
             table[name] = spec.fn(table)
 
     return table[marrmot.MODEL_REGISTRY[model_num]['param_names']]
+
+
+# ---------------------------------------------------------------------------
+# Editable range tables (used by the Streamlit apps)
+# ---------------------------------------------------------------------------
+
+def space_table(model_num, space=None):
+    """The parameter space as a table: parameter, how it is sampled, low, high."""
+    space = PARAM_SPACE[model_num] if space is None else space
+    rows = []
+    for name, spec in space.items():
+        if isinstance(spec, tuple):
+            rows.append({"parameter": name, "sampled as": "range", "low": spec[0], "high": spec[1]})
+        elif isinstance(spec, Frac):
+            ref = spec.ref if isinstance(spec.ref, str) else "a function of others"
+            rows.append({"parameter": name, "sampled as": f"fraction of {ref}",
+                         "low": spec.lo, "high": spec.hi})
+        else:
+            rows.append({"parameter": name, "sampled as": "derived", "low": None, "high": None})
+    return pd.DataFrame(rows)
+
+
+def space_from_table(model_num, table):
+    """Inverse of `space_table`: the default space with the table's low/high
+    values (Derived parameters are kept as they are)."""
+    space = {}
+    for row, (name, spec) in zip(table.itertuples(index=False), PARAM_SPACE[model_num].items()):
+        if isinstance(spec, Derived):
+            space[name] = spec
+            continue
+        lo, hi = float(row.low), float(row.high)
+        if not (np.isfinite(lo) and np.isfinite(hi) and lo <= hi):
+            raise ValueError(f"parameter {name}: low must be a number <= high")
+        space[name] = with_bounds(spec, lo, hi)
+    return space

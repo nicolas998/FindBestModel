@@ -1,6 +1,7 @@
 # Downloaded forcing / streamflow and model search results
 data/
 performance/
+nsga_calib/
 
 # Python
 __pycache__/
