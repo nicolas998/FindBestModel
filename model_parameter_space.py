@@ -52,6 +52,10 @@ DDF = (0, 20)            # degree-day factor [mm/degC/d]
 INTERCEPTION = (0, 5)    # interception capacity / loss [mm, mm/d]
 TANK_THRESH = (0, 200)   # Tank-model outlet heights [mm]
 
+# How far a calibration that widens its search ranges may take a maximum
+# storage (see `default_limits`).
+STORE_LIMIT = 4000  # [mm]
+
 # (a * max(0, S - Sfc)) ** b form used by models 4, 11 and 16 in this port:
 # `a` has to be small or the flux explodes for b > 1.
 SUBSURFACE_A = (0.001, 0.1)
@@ -209,6 +213,32 @@ def free_parameters(space):
     return [name for name, spec in space.items() if not isinstance(spec, Derived)]
 
 
+def spec_bounds(spec):
+    """(low, high) of a range or of a fraction."""
+    return (spec[0], spec[1]) if isinstance(spec, tuple) else (spec.lo, spec.hi)
+
+
+def with_bounds(spec, lo, hi):
+    """The same range or fraction with new bounds."""
+    return (lo, hi) if isinstance(spec, tuple) else Frac(spec.ref, lo, hi)
+
+
+def default_limits(model_num):
+    """
+    {name: (min, max)}: how far a calibration that widens its search ranges
+    (nsga_calibration.py) may take each sampled parameter by default.
+
+    Maximum storages (the generic STORE range) may grow up to STORE_LIMIT.
+    Every other parameter stays within its default range: rates, fractions,
+    exponents, temperatures and days of the year have physical or numerical
+    limits (e.g. a field capacity equal to the maximum storage divides by
+    zero in some fluxes) that no general rule captures.
+    """
+    space = PARAM_SPACE[model_num]
+    return {name: (STORE[0], STORE_LIMIT) if space[name] == STORE else spec_bounds(space[name])
+            for name in free_parameters(space)}
+
+
 def latin_hypercube(n, k, rng):
     """(n, k) Latin-hypercube sample of the unit cube."""
     edges = np.linspace(0.0, 1.0, n + 1)
@@ -301,5 +331,5 @@ def space_from_table(model_num, table):
         lo, hi = float(row.low), float(row.high)
         if not (np.isfinite(lo) and np.isfinite(hi) and lo <= hi):
             raise ValueError(f"parameter {name}: low must be a number <= high")
-        space[name] = (lo, hi) if isinstance(spec, tuple) else Frac(spec.ref, lo, hi)
+        space[name] = with_bounds(spec, lo, hi)
     return space

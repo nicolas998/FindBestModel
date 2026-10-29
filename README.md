@@ -157,7 +157,8 @@ In the sidebar, choose a gauge, the scored years, a spin-up in days (the
 simulation starts that many days before January 1st of the first year), the
 precipitation source, the potential-ET method and a model, and optionally
 narrow its parameter search ranges. Then pick one to three CPMs: the presets,
-or any configuration saved with `cpm_app.py` in `cpm_configs/`. The NSGA-II
+any configuration saved with `cpm_app.py` in `cpm_configs/`, or JSON files
+uploaded in the app (the files `cpm_app.py` saves or downloads). The NSGA-II
 settings are the calibrations per generation (population size), the number
 of generations, the crossover probability and distribution index (SBX), the
 mutation rate (per parameter; 1 / number of parameters by default) and
@@ -166,7 +167,19 @@ processes.
 
 NSGA-II searches in the unit cube of the model's free parameters, so
 thresholds defined as fractions (e.g. field capacity of maximum storage)
-always stay valid. The results show:
+always stay valid.
+
+With **Dynamic search ranges** (on by default), every few generations a
+search range widens on any side where the population's Pareto front crowds
+against it: by default, when at least 25% of the front lies within 5% of a
+bound, that bound moves out by 50% of the range. It never moves past the
+parameter's **min/max allowed** in the parameter table. By default maximum
+storages may grow to 4000 mm (`STORE_LIMIT` in `model_parameter_space.py`),
+and every other parameter only up to its default range, because rates,
+fractions, exponents, temperatures and days of the year have physical or
+numerical limits. Raise a limit in the table to let a parameter go further.
+
+The results show:
 
 - the objective space: every simulation and the Pareto front. With three
   CPMs, one panel per pair of CPMs, each with the front of that pair in its
@@ -174,6 +187,9 @@ always stay valid. The results show:
 - the hydrograph, flow duration curve and Q-Q plot of the members of the
   fronts you select, over the observations, with one member highlighted on
   demand;
+- the distribution of every parameter on each selected front, over its
+  search range (front members piled against a bound suggest widening it),
+  and the search range changes of a dynamic run;
 - the best CPM per generation, and the table of front members with their
   parameters.
 
@@ -181,7 +197,7 @@ Every run is saved in `nsga_calib/<date>_usgs<gauge>_m<model>/`:
 
 | File | Contents |
 |---|---|
-| `settings.json` | gauge, period, spin-up, forcing, model, objectives and their weights, parameter ranges, NSGA-II settings |
+| `settings.json` | gauge, period, spin-up, forcing, model, objectives and their weights, NSGA-II settings, the initial and final parameter ranges, their allowed limits and every range change |
 | `evaluations.csv` | every simulation: generation, parameters, CPM of each objective, every CPM component, KGE, NSE, error, and one `front_*` flag per front |
 | `history.csv` | best CPM so far per objective after each generation |
 | `pareto_fronts.csv` | the simulations on any front |

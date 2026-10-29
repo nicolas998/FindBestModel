@@ -12,6 +12,10 @@ generation binary tournament selection on (front rank, crowding distance),
 simulated binary crossover (SBX), polynomial mutation and elitist survival of
 the best `pop_size` of parents + offspring.
 
+Optionally the search ranges widen while it runs (`widen_ranges`): every few
+generations, a bound that many members of the population's front crowd
+against moves out, never past the parameter's allowed limits.
+
 Every evaluation is appended to <run>/evaluations.csv as soon as its
 generation finishes, so an interrupted run keeps what it computed. When the
 run ends, the Pareto fronts of the whole archive (every objective together
@@ -45,7 +49,8 @@ import pandas as pd
 import composite_metric as cm
 import find_best_model as fbm
 import marrmot_models as marrmot
-from model_parameter_space import free_parameters, latin_hypercube, params_from_unit, space_table
+from model_parameter_space import (default_limits, free_parameters, latin_hypercube,
+                                   params_from_unit, space_table, spec_bounds, with_bounds)
 
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE / "nsga_calib"
@@ -212,6 +217,75 @@ def survivors(F, n):
 
 
 # ---------------------------------------------------------------------------
+# Dynamic search ranges
+# ---------------------------------------------------------------------------
+
+# Settings of `widen_ranges` in a calibration (see `calibrate`)
+ADAPT_DEFAULTS = {"adapt_ranges": False, "adapt_every": 5, "adapt_edge": 0.05,
+                  "adapt_share": 0.25, "adapt_step": 0.5}
+
+
+def range_table(model, space=None, limits=None):
+    """`space_table` plus the allowed limits of every sampled parameter
+    (`default_limits` unless given)."""
+    table = space_table(model, space)
+    limits = default_limits(model) if limits is None else limits
+    table["min allowed"] = [limits.get(p, (None, None))[0] for p in table["parameter"]]
+    table["max allowed"] = [limits.get(p, (None, None))[1] for p in table["parameter"]]
+    return table
+
+
+def limits_from_table(model, table, space):
+    """{name: (min, max)} from a `range_table`; every search range has to
+    lie within its limits."""
+    limits = {}
+    for _, row in table.iterrows():
+        name = row["parameter"]
+        if name not in free_parameters(space):
+            continue
+        floor, ceiling = float(row["min allowed"]), float(row["max allowed"])
+        lo, hi = spec_bounds(space[name])
+        if not (np.isfinite(floor) and np.isfinite(ceiling) and floor <= lo <= hi <= ceiling):
+            raise ValueError(f"parameter {name}: needs min allowed <= low <= high <= max allowed")
+        limits[name] = (floor, ceiling)
+    return limits
+
+
+def widen_ranges(space, limits, X, F, edge=0.05, share=0.25, step=0.5):
+    """
+    Moves out the bounds that the population's front crowds against.
+
+    A bound moves when at least `share` of the front (rank 0 of `F`) lies
+    within `edge` of it (both as fractions of the range): by `step` times
+    the range's width, but never past the parameter's limits. Fractions
+    widen their fraction bounds. The points of `X` are moved so that every
+    member keeps its parameter values.
+
+    Returns:
+        tuple[dict, np.ndarray, list]: (new space, new X, changes as
+            {'parameter', 'side', 'from', 'to'}).
+    """
+    front = X[non_dominated_sort(F) == 0]
+    space, X, changes = dict(space), X.copy(), []
+    for j, name in enumerate(free_parameters(space)):
+        lo, hi = spec_bounds(space[name])
+        floor, ceiling = limits[name]
+        width = hi - lo
+        new_lo, new_hi = lo, hi
+        if width > 0 and hi < ceiling and np.mean(front[:, j] >= 1.0 - edge) >= share:
+            new_hi = min(ceiling, hi + step * width)
+        if width > 0 and lo > floor and np.mean(front[:, j] <= edge) >= share:
+            new_lo = max(floor, lo - step * width)
+        if (new_lo, new_hi) == (lo, hi):
+            continue
+        X[:, j] = (lo + X[:, j] * width - new_lo) / (new_hi - new_lo)
+        space[name] = with_bounds(space[name], new_lo, new_hi)
+        changes += [{"parameter": name, "side": side, "from": old, "to": new}
+                    for side, old, new in (("low", lo, new_lo), ("high", hi, new_hi)) if old != new]
+    return space, X, changes
+
+
+# ---------------------------------------------------------------------------
 # Objectives and fronts
 # ---------------------------------------------------------------------------
 
@@ -283,17 +357,22 @@ def _write_settings(path, settings):
     (path / "settings.json").write_text(json.dumps(settings, indent=2, default=cm._json_default))
 
 
-def calibrate(settings, data, space, objectives, progress=None):
+def calibrate(settings, data, space, objectives, limits=None, progress=None):
     """
     Runs NSGA-II and saves every result under nsga_calib/.
 
     Parameters:
         settings (dict): gauge, start_year, end_year, spinup_days, et_method,
             precip_source, model, pop_size, generations, crossover_prob,
-            crossover_eta, mutation_prob, mutation_eta, seed, n_procs.
+            crossover_eta, mutation_prob, mutation_eta, seed, n_procs and,
+            optionally, the keys of ADAPT_DEFAULTS: with adapt_ranges, every
+            adapt_every generations `widen_ranges` runs with adapt_edge,
+            adapt_share and adapt_step.
         data (dict): output of `prepare_data`.
         space (dict): parameter space (layout of PARAM_SPACE[model]).
         objectives (list[dict]): 1-3 CPMs as {'id', 'name', 'weights'}.
+        limits (dict, optional): {name: (min, max)} the ranges may widen
+            to; `default_limits` if not given.
         progress (callable, optional): progress(generation, history_row)
             after every generation (0 = the initial population).
 
@@ -309,13 +388,19 @@ def calibrate(settings, data, space, objectives, progress=None):
 
     names = free_parameters(space)
     n_pop, n_gen = settings["pop_size"], settings["generations"]
+    limits = default_limits(model) if limits is None else limits
+    ranges = space_table(model, space).to_dict("records")
     settings = {
+        **ADAPT_DEFAULTS,
         **settings,
         "model_name": marrmot.MODEL_REGISTRY[model]["name"],
         "mutation_prob": (1.0 / len(names) if settings.get("mutation_prob") is None
                           else settings["mutation_prob"]),
         "objectives": objectives,
-        "parameter_ranges": space_table(model, space).to_dict("records"),
+        "parameter_ranges": ranges,
+        "parameter_limits": {name: list(limits[name]) for name in names},
+        "parameter_ranges_final": ranges,
+        "range_changes": [],
         "free_parameters": names,
         "simulation_start": str((data["dates"][0] - pd.Timedelta(days=settings["spinup_days"])).date()),
         "status": "running",
@@ -367,6 +452,14 @@ def calibrate(settings, data, space, objectives, progress=None):
             X, F = np.vstack([X, children]), np.vstack([F, F_children])
             keep = survivors(F, n_pop)
             X, F = X[keep], F[keep]
+            if (settings["adapt_ranges"] and generation % settings["adapt_every"] == 0
+                    and generation < n_gen):
+                space, X, changes = widen_ranges(space, limits, X, F, settings["adapt_edge"],
+                                                 settings["adapt_share"], settings["adapt_step"])
+                if changes:
+                    settings["range_changes"] += [{"generation": generation, **c} for c in changes]
+                    settings["parameter_ranges_final"] = space_table(model, space).to_dict("records")
+                    _write_settings(path, settings)
 
     evaluations = pd.concat(tables)
     settings.update(status="complete", elapsed_s=round(time.time() - t0, 2),

@@ -32,7 +32,7 @@ import composite_metric as cm
 import get_usgs_gauge_data as usgs
 import marrmot_models as marrmot
 import nsga_calibration as nc
-from model_parameter_space import PARAM_SPACE, free_parameters, space_from_table, space_table
+from model_parameter_space import PARAM_SPACE, free_parameters, space_from_table
 
 DEFAULT_MODEL = 11  # Collie River Basin 3 (CRB3)
 DEFAULT_OBJECTIVES = ["Timing only", "Distribution only"]
@@ -74,9 +74,10 @@ def _weights_text(weights):
 
 
 def _objective_choices():
-    """{key: objective}: saved configurations first, then the presets that
-    are not saved under the same weights."""
-    choices = {}
+    """{key: objective}: uploaded configurations first, then the ones saved
+    in cpm_configs/, then the presets that are not there under the same
+    weights."""
+    choices = dict(ss.uploaded_cpms)
     for path, record in cm.library():
         try:
             config = cm.parse_configs(json.dumps(record))[0]
@@ -88,6 +89,33 @@ def _objective_choices():
         choices.setdefault(cid, {"id": cid, "name": name, "source": "preset",
                                  "weights": {k: float(weights.get(k, 0.0)) for k in cm.COMPONENT_KEYS}})
     return choices
+
+
+def _upload_cpms():
+    """Adds the uploaded CPM files to the choices and selects them while
+    fewer than three CPMs are picked."""
+    for file in ss[f"cpm_upload_{ss.upload_n}"] or []:
+        try:
+            configs = cm.parse_configs(file.getvalue().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            ss.upload_messages.append(("error", f"{file.name} is not a CPM configuration file: {exc}"))
+            continue
+        for config in configs:
+            ss.uploaded_cpms[config["id"]] = {**config, "source": f"upload: {file.name}"}
+            if config["id"] in ss.objectives:
+                continue
+            if len(ss.objectives) < 3:
+                ss.objectives.append(config["id"])
+            else:
+                ss.upload_messages.append(("warning", f"{config['id']} added to the list but not "
+                                                      "selected: three CPMs are already picked"))
+    ss.upload_n += 1  # a fresh uploader, so the same file can be uploaded again
+
+
+ss.setdefault("uploaded_cpms", {})
+ss.setdefault("upload_messages", [])
+ss.setdefault("upload_n", 0)
+ss.setdefault("objectives", [cm.config_id(cm.PRESETS[name]) for name in DEFAULT_OBJECTIVES])
 
 
 # ---------------------------------------------------------------------------
@@ -113,24 +141,33 @@ with st.sidebar:
     model = st.selectbox("MARRMoT model", models, index=models.index(DEFAULT_MODEL),
                          format_func=lambda m: f"{m:02d} · {marrmot.MODEL_REGISTRY[m]['name']}")
     with st.expander("Parameter search ranges (optional)"):
-        st.caption("NSGA-II searches between low and high. Fractions multiply the parameter "
-                   "they refer to; derived parameters are computed from the others.")
-        ranges = st.data_editor(space_table(model), key=f"ranges_{model}", hide_index=True,
+        st.caption("NSGA-II starts searching between low and high. With dynamic ranges (NSGA-II "
+                   "section) a range can widen up to min/max allowed: by default maximum "
+                   "storages up to 4000 mm, every other parameter only up to its default range. "
+                   "Fractions multiply the parameter they refer to; derived parameters are "
+                   "computed from the others.")
+        ranges = st.data_editor(nc.range_table(model), key=f"ranges_{model}", hide_index=True,
                                 disabled=["parameter", "sampled as"], width="stretch")
     n_free = len(free_parameters(PARAM_SPACE[model]))
 
     st.header("Objectives")
+    st.file_uploader("Upload CPM configuration(s) (JSON)", type="json", accept_multiple_files=True,
+                     key=f"cpm_upload_{ss.upload_n}", on_change=_upload_cpms,
+                     help="Files saved or downloaded with the CPM explorer (cpm_app.py): one "
+                          "configuration, a list of them, or {\"configs\": [...]}.")
+    for kind, text in ss.upload_messages:
+        getattr(st, kind)(text)
+    ss.upload_messages = []
     choices = _objective_choices()
-    default_ids = [cm.config_id(cm.PRESETS[name]) for name in DEFAULT_OBJECTIVES]
+    ss.objectives = [i for i in ss.objectives if i in choices]  # e.g. a deleted library file
     picked = st.multiselect(
-        "CPMs to maximize (1–3)", list(choices), default=[i for i in default_ids if i in choices],
-        max_selections=3,
-        format_func=lambda i: f"{i} · {choices[i]['name']}"
-                              + (" (preset)" if choices[i]["source"] == "preset" else ""),
-        help="Presets, plus the configurations saved with the CPM explorer (cpm_app.py) in "
-             "cpm_configs/.")
+        "CPMs to maximize (1–3)", list(choices), key="objectives", max_selections=3,
+        format_func=lambda i: f"{i} · {choices[i]['name']}" + {
+            "preset": " (preset)", "upload": " (uploaded)"}.get(choices[i]["source"].split(":")[0], ""),
+        help="Uploaded configurations, the ones saved with the CPM explorer (cpm_app.py) in "
+             "cpm_configs/, and the presets.")
     for i in picked:
-        st.caption(f"**{i}**: {_weights_text(choices[i]['weights'])}")
+        st.caption(f"**{i}** ({choices[i]['source']}): {_weights_text(choices[i]['weights'])}")
 
     st.header("NSGA-II")
     c1, c2 = st.columns(2)
@@ -159,6 +196,23 @@ with st.sidebar:
                                    "once for the whole calibration (a few seconds on Windows).")
     st.caption(f"{pop_size * (generations + 1):,} simulations: {pop_size} initial + "
                f"{pop_size} × {generations} generations.")
+
+    adapt = nc.ADAPT_DEFAULTS
+    adapt_ranges = st.toggle("Dynamic search ranges", value=True,
+                             help="Widen a parameter's search range when the Pareto front "
+                                  "crowds against one of its bounds, up to the min/max allowed "
+                                  "in the parameter table.")
+    if adapt_ranges:
+        c1, c2 = st.columns(2)
+        adapt_every = c1.number_input("Check every (generations)", 1, 100, adapt["adapt_every"])
+        adapt_step = c2.number_input("Widen by (% of range)", 5, 200, int(100 * adapt["adapt_step"]),
+                                     step=5, help="How far a bound moves each time.")
+        c1, c2 = st.columns(2)
+        adapt_edge = c1.number_input("Edge zone (% of range)", 1, 25, int(100 * adapt["adapt_edge"]),
+                                     help="How close to a bound a member counts as at the bound.")
+        adapt_share = c2.number_input("Front at the edge (%)", 5, 100, int(100 * adapt["adapt_share"]),
+                                      step=5, help="Share of the front in the edge zone that "
+                                                   "makes the bound move.")
     run_clicked = st.button("Calibrate", type="primary", width="stretch", disabled=not picked)
 
     st.header("Saved calibrations")
@@ -192,10 +246,15 @@ if run_clicked:
             "crossover_eta": float(crossover_eta),
             "mutation_prob": None if mutation_prob is None else float(mutation_prob),
             "mutation_eta": float(mutation_eta), "seed": int(seed), "n_procs": int(n_procs),
+            "adapt_ranges": adapt_ranges,
         }
+        if adapt_ranges:
+            settings.update(adapt_every=int(adapt_every), adapt_step=adapt_step / 100,
+                            adapt_edge=adapt_edge / 100, adapt_share=adapt_share / 100)
         objectives = [{k: choices[i][k] for k in ("id", "name", "weights")} for i in picked]
         try:
             space = space_from_table(model, ranges)
+            limits = nc.limits_from_table(model, ranges, space)
             with st.status("Preparing the gauge data...", expanded=True) as status:
                 data, log = nc.prepare_data(gauge, settings["start_year"], settings["end_year"],
                                             settings["spinup_days"], et_method, model, precip_source)
@@ -212,7 +271,7 @@ if run_clicked:
                                  text=f"Generation {generation}/{settings['generations']} · "
                                       f"best {best}")
 
-                ss.run = nc.calibrate(settings, data, space, objectives, progress=progress)
+                ss.run = nc.calibrate(settings, data, space, objectives, limits, progress=progress)
                 status.update(label=f"{len(ss.run['evaluations'])} simulations in "
                                     f"{time.time() - t0:.0f} s, saved to "
                                     f"nsga_calib/{ss.run['path'].name}",
@@ -261,7 +320,10 @@ st.caption(
     f"ET {settings['et_method']}. NSGA-II: {settings['pop_size']} per generation × "
     f"{settings['generations']} generations, crossover {settings['crossover_prob']:g} "
     f"(ηc {settings['crossover_eta']:g}), mutation {mutation:.3g} (ηm {settings['mutation_eta']:g}), "
-    f"seed {settings['seed']}. Saved in `nsga_calib/{run['path'].name}`.")
+    f"seed {settings['seed']}. "
+    + (f"Dynamic search ranges: {len(settings['range_changes'])} bound(s) widened. "
+       if settings.get("adapt_ranges") else "")
+    + f"Saved in `nsga_calib/{run['path'].name}`.")
 if settings.get("status") == "interrupted":
     st.warning(f"This run was interrupted after generation {int(evaluations['generation'].max())} "
                f"of {settings['generations']}; the fronts use the evaluations it finished.")
@@ -471,6 +533,88 @@ with c2:
 st.caption("Both use only the days with an observed flow. The Q-Q plot compares the 0, 1, ..., "
            "100th percentiles: above the 1:1 line the simulation overestimates those flows.")
 
+# Parameter distributions: one panel per parameter, one row per front
+st.subheader("Parameter distributions")
+param_names = marrmot.MODEL_REGISTRY[settings["model"]]["param_names"]
+initial = {r["parameter"]: r for r in settings["parameter_ranges"]}
+# Runs from before dynamic ranges have no final ranges: they never changed
+search = {r["parameter"]: r for r in settings.get("parameter_ranges_final", settings["parameter_ranges"])}
+with_all = st.toggle("Show every simulation as a reference", value=True, key="params_all")
+groups = [(fronts[k][0], evaluations.loc[members[k]], front_color[k]) for k in shown]
+if with_all:
+    groups.append(("All simulations", evaluations[ok], ink["muted"]))
+if not groups:
+    st.info("Select at least one front above to see its parameters.")
+else:
+    n_cols = 4
+    n_rows = -(-len(param_names) // n_cols)
+    panel_height = 70 + 24 * len(groups)
+    height = n_rows * panel_height + 40
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols, horizontal_spacing=0.04, vertical_spacing=60 / height,
+        subplot_titles=[p if search[p]["sampled as"] == "range" else f"{p} ({search[p]['sampled as']})"
+                        for p in param_names])
+    for n, p in enumerate(param_names):
+        row, col = n // n_cols + 1, n % n_cols + 1
+        # Added bottom-up: the reference sits at the bottom, the fronts above it in legend order
+        for label, rows, color in reversed(groups):
+            reference = label == "All simulations"
+            fig.add_trace(go.Box(
+                x=rows[p], name=label, orientation="h", legendgroup=label, showlegend=n == 0,
+                line=dict(color=color, width=1.5), fillcolor="rgba(0,0,0,0)",
+                boxpoints=False if reference else "all", jitter=0.5, pointpos=0,
+                marker=dict(color=color, size=5), hoveron="boxes" if reference else "points",
+                text=[f"#{e}" for e in rows.index],
+                hovertemplate=None if reference else f"%{{text}}: %{{x:.4g}}<extra>{label}</extra>"),
+                row=row, col=col)
+        if search[p]["sampled as"] == "range":
+            lo, hi = search[p]["low"], search[p]["high"]
+        else:
+            lo, hi = evaluations.loc[ok, p].min(), evaluations.loc[ok, p].max()
+        pad = 0.03 * (hi - lo or 1.0)
+        fig.update_xaxes(range=[lo - pad, hi + pad], row=row, col=col)
+        if search[p]["sampled as"] == "range":
+            for side in ("low", "high"):
+                if initial[p][side] != search[p][side]:  # where the search started
+                    fig.add_vline(x=initial[p][side], row=row, col=col,
+                                  line=dict(color=ink["muted"], width=1.5, dash="dot"))
+        if highlight is not None:
+            fig.add_vline(x=evaluations.loc[highlight, p], row=row, col=col,
+                          line=dict(color=highlight_color, width=2))
+    _style(fig, height)
+    fig.update_yaxes(showticklabels=False)
+    # Legend above the first row's panel titles
+    fig.update_layout(legend=dict(traceorder="reversed", y=1 + 34 / (height - 90)),
+                      margin=dict(t=80), hovermode="closest")
+    fig.update_annotations(font_size=13)
+    st.plotly_chart(fig, width="stretch")
+    widened = bool(settings.get("range_changes"))
+    st.caption("Each row is a front (in legend order, top to bottom): a box from the 25th to the "
+               "75th percentile with the median, and every member as a dot. Parameters searched "
+               "over a range span exactly that range"
+               + (" (after widening; a dotted line marks a bound where the search started)"
+                  if widened else "")
+               + ", so members piled against an edge suggest widening it; the others (fractions "
+                 "and derived) span the values simulated."
+               + (f" The vertical line is #{highlight}." if highlight is not None else ""))
+
+if settings.get("adapt_ranges"):
+    changes = pd.DataFrame(settings["range_changes"])
+    with st.expander(f"Search range changes ({len(changes)})"):
+        if changes.empty:
+            st.caption("No bound was widened: the front never crowded against a bound that "
+                       "could still move.")
+        else:
+            st.dataframe(changes, hide_index=True, width="stretch")
+        final = pd.DataFrame(settings["parameter_ranges_final"])
+        limits = final["parameter"].map(lambda p: settings["parameter_limits"].get(p, [None, None]))
+        final["min allowed"], final["max allowed"] = limits.str[0], limits.str[1]
+        st.dataframe(final, hide_index=True, width="stretch")
+        st.caption(f"Final search ranges. Checked every {settings['adapt_every']} generations: a "
+                   f"bound moved by {settings['adapt_step']:.0%} of its range when at least "
+                   f"{settings['adapt_share']:.0%} of the population's front was within "
+                   f"{settings['adapt_edge']:.0%} of it.")
+
 # Convergence
 st.subheader("Convergence")
 history = run["history"]
@@ -490,7 +634,6 @@ on_any = evaluations.filter(like="front_").any(axis=1)
 table = evaluations[on_any].copy()
 table.insert(1, "fronts", [", ".join(fronts[k][0] for k in fronts if row[f"front_{k}"])
                            for _, row in table.iterrows()])
-param_names = marrmot.MODEL_REGISTRY[settings["model"]]["param_names"]
 table = table[["generation", "fronts", *ids, "KGE", "NSE_raw", *param_names]]
 st.dataframe(table, width="stretch",
              column_config={c: st.column_config.NumberColumn(format="%.3f")
