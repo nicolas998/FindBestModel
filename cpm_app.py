@@ -33,7 +33,7 @@ import composite_metric as cm
 import find_best_model as fbm
 import get_usgs_gauge_data as usgs
 import marrmot_models as marrmot
-from model_parameter_space import PARAM_SPACE, Derived, Frac, sample_parameters
+from model_parameter_space import sample_parameters, space_from_table, space_table
 
 MAX_CONFIGS = 5
 DEFAULT_MODEL = 11  # Collie River Basin 3 (CRB3)
@@ -49,13 +49,7 @@ INK = {
     "dark": {"obs": "#f0efec", "muted": "#898781", "grid": "#2c2c2a", "axis": "#383835"},
 }
 
-PRESETS = {
-    "Equal weights": cm.DEFAULT_WEIGHTS,
-    "KGE (r, mean, deviation)": {"pearson": 10.0, "mean_ratio": 10.0, "std_ratio": 10.0},
-    "Timing only": {"NSE": 10.0, "pearson": 10.0, "spearman": 10.0},
-    "Distribution only": {"mean_ratio": 10.0, "std_ratio": 10.0,
-                          **{f"P{p}": 10.0 for p in cm.PERCENTILES}},
-}
+PRESETS = cm.PRESETS
 
 SLIDER_GROUPS = {
     "Timing / error": ["NSE", "pearson", "spearman"],
@@ -201,33 +195,6 @@ if not ss.configs:
 # Experiment: data + random ensemble
 # ---------------------------------------------------------------------------
 
-def _range_table(model):
-    rows = []
-    for name, spec in PARAM_SPACE[model].items():
-        if isinstance(spec, tuple):
-            rows.append({"parameter": name, "sampled as": "range", "low": spec[0], "high": spec[1]})
-        elif isinstance(spec, Frac):
-            ref = spec.ref if isinstance(spec.ref, str) else "a function of others"
-            rows.append({"parameter": name, "sampled as": f"fraction of {ref}",
-                         "low": spec.lo, "high": spec.hi})
-        else:
-            rows.append({"parameter": name, "sampled as": "derived", "low": None, "high": None})
-    return pd.DataFrame(rows)
-
-
-def _space_from_table(model, table):
-    space = {}
-    for row, (name, spec) in zip(table.itertuples(index=False), PARAM_SPACE[model].items()):
-        if isinstance(spec, Derived):
-            space[name] = spec
-            continue
-        lo, hi = float(row.low), float(row.high)
-        if not (np.isfinite(lo) and np.isfinite(hi) and lo <= hi):
-            raise ValueError(f"parameter {name}: low must be a number <= high")
-        space[name] = (lo, hi) if isinstance(spec, tuple) else Frac(spec.ref, lo, hi)
-    return space
-
-
 def _clean_log(text):
     """Keeps the last state of lines rewritten with carriage returns."""
     return "\n".join(line.split("\r")[-1] for line in text.splitlines())
@@ -295,7 +262,7 @@ with st.sidebar:
     with st.expander("Parameter ranges"):
         st.caption("Latin-hypercube sampling between low and high. "
                    "Fractions multiply the parameter they refer to.")
-        ranges = st.data_editor(_range_table(model), key=f"ranges_{model}", hide_index=True,
+        ranges = st.data_editor(space_table(model), key=f"ranges_{model}", hide_index=True,
                                 disabled=["parameter", "sampled as"], width="stretch")
     n_realizations = st.number_input("Random realizations", 10, 5000, 100, step=10)
     c1, c2 = st.columns(2)
@@ -319,7 +286,7 @@ if run_clicked:
         st.error("The last year must not be before the first year")
     else:
         try:
-            space = _space_from_table(model, ranges)
+            space = space_from_table(model, ranges)
             ss.run = run_experiment({
                 "gauge": gauge, "start_year": int(start_year), "end_year": int(end_year),
                 "warmup_years": int(warmup_years), "precip_source": precip_source,

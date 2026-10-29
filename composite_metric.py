@@ -27,6 +27,7 @@ Streamlit app (`cpm_app.py`) scores, and reads/writes CPM configurations as
 JSON files.
 """
 
+import contextlib
 import hashlib
 import json
 import math
@@ -63,6 +64,14 @@ COMPONENTS = {
 COMPONENT_KEYS = list(COMPONENTS)
 
 DEFAULT_WEIGHTS = dict.fromkeys(COMPONENT_KEYS, 5.0)
+
+PRESETS = {
+    "Equal weights": DEFAULT_WEIGHTS,
+    "KGE (r, mean, deviation)": {"pearson": 10.0, "mean_ratio": 10.0, "std_ratio": 10.0},
+    "Timing only": {"NSE": 10.0, "pearson": 10.0, "spearman": 10.0},
+    "Distribution only": {"mean_ratio": 10.0, "std_ratio": 10.0,
+                          **{f"P{p}": 10.0 for p in PERCENTILES}},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +315,19 @@ def _simulate_chunk(model_num, start, param_rows):
     return start, [_simulate_one(model_num, params) for params in param_rows]
 
 
-def run_ensemble(model_num, data, samples, n_procs=1, progress=None):
+def _worker_data(data):
+    return {k: data[k] for k in ("P", "Ep", "T", "t", "eval_mask")}
+
+
+def ensemble_pool(data, n_procs):
+    """A process pool whose workers hold `data`, to pass to `run_ensemble`
+    when it is called many times on the same data (e.g. once per NSGA-II
+    generation). Use it as a context manager."""
+    return ProcessPoolExecutor(max_workers=n_procs, initializer=_init_worker,
+                               initargs=(_worker_data(data),))
+
+
+def run_ensemble(model_num, data, samples, n_procs=1, progress=None, pool=None):
     """
     Simulates every parameter set in `samples` and keeps the series.
 
@@ -316,13 +337,15 @@ def run_ensemble(model_num, data, samples, n_procs=1, progress=None):
         samples (pd.DataFrame): one parameter set per row.
         n_procs (int): parallel processes (1 = run here, in this process).
         progress (callable, optional): called as progress(done, total).
+        pool (ProcessPoolExecutor, optional): from `ensemble_pool(data,
+            n_procs)`; used instead of starting a new one.
 
     Returns:
         tuple[np.ndarray, list]: (Q, errors). Q is (len(samples), T) over the
             evaluation period, NaN rows for the failed realizations; errors
             holds None or the error message of each realization.
     """
-    worker_data = {k: data[k] for k in ("P", "Ep", "T", "t", "eval_mask")}
+    worker_data = _worker_data(data)
     records = samples.to_dict("records")
     n = len(records)
     Q = np.full((n, int(np.sum(data["eval_mask"]))), np.nan)
@@ -335,7 +358,7 @@ def run_ensemble(model_num, data, samples, n_procs=1, progress=None):
             else:
                 Q[i] = q
 
-    if n_procs <= 1:
+    if n_procs <= 1 and pool is None:
         _DATA.update(worker_data)
         with warnings.catch_warnings(), np.errstate(all="ignore"):
             warnings.simplefilter("ignore")
@@ -345,10 +368,9 @@ def run_ensemble(model_num, data, samples, n_procs=1, progress=None):
                     progress(i + 1, n)
         return Q, errors
 
-    chunk = max(1, min(MAX_CHUNK, math.ceil(n / n_procs)))
+    chunk =max(1, min(MAX_CHUNK, math.ceil(n / n_procs)))
     done = 0
-    with ProcessPoolExecutor(max_workers=n_procs, initializer=_init_worker,
-                             initargs=(worker_data,)) as pool:
+    with contextlib.nullcontext(pool) if pool is not None else ensemble_pool(data, n_procs) as pool:
         futures = {pool.submit(_simulate_chunk, model_num, s, records[s:s + chunk]):
                    (s, len(records[s:s + chunk])) for s in range(0, n, chunk)}
         for fut in as_completed(futures):
